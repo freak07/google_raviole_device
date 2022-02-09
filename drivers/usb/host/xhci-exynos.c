@@ -23,6 +23,7 @@
 #include <linux/phy/phy.h>
 #include <linux/acpi.h>
 #include <linux/usb/of.h>
+#include <linux/pm.h>
 
 #include <core/phy.h> /* $(srctree)/drivers/usb/core/phy.h */
 #include <host/xhci.h> /* $(srctree)/drivers/usb/host/xhci.h */
@@ -32,6 +33,8 @@
 #include "xhci-exynos.h"
 #include "../dwc3/dwc3-exynos.h"
 #include <soc/google/exynos-cpupm.h>
+#include <trace/hooks/sound.h>
+#include <trace/hooks/usb.h>
 
 static struct hc_driver xhci_exynos_hc_driver;
 
@@ -65,11 +68,22 @@ int xhci_exynos_bus_suspend(struct usb_hcd *hcd)
 	struct xhci_hcd_exynos *xhci_exynos = priv->xhci_exynos;
 	struct xhci_hcd *xhci = hcd_to_xhci(hcd);
 	int ret, ret_phy, main_hcd;
+	int bypass = 0;
+	struct usb_device *udev = hcd->self.root_hub;
+	pm_message_t msg;
 
 	if (hcd == xhci->main_hcd)
 		main_hcd = 1;
 	else
 		main_hcd = 0;
+
+	msg.event = 0;
+	trace_android_vh_usb_dev_suspend(udev, msg, &bypass);
+	if (bypass) {
+		ret = 0;
+		ret_phy = 0;
+		return 0;
+	}
 
 	ret = xhci_bus_suspend(hcd);
 
@@ -91,11 +105,21 @@ int xhci_exynos_bus_resume(struct usb_hcd *hcd)
 	struct xhci_hcd_exynos *xhci_exynos = priv->xhci_exynos;
 	struct xhci_hcd *xhci = hcd_to_xhci(hcd);
 	int ret, main_hcd;
+	int bypass = 0;
+	struct usb_device *udev = hcd->self.root_hub;
+	pm_message_t msg;
 
 	if (hcd == xhci->main_hcd)
 		main_hcd = 1;
 	else
 		main_hcd = 0;
+
+	msg.event = 0;
+	trace_android_vh_usb_dev_resume(udev, msg, &bypass);
+	if (bypass) {
+		ret = 0;
+		return 0;
+	}
 
 	if (hcd == xhci->main_hcd &&
 	    xhci_exynos->port_state == PORT_USB2) {
@@ -245,10 +269,16 @@ static int xhci_exynos_check_port(struct xhci_hcd_exynos *exynos, struct usb_dev
 	int usb2_detect = 0;
 	int port, i;
 	int bInterfaceClass = 0;
+	bool ap_suspend_enabled = false;
 
 	if (udev->bus->root_hub == udev) {
 		dev_dbg(ddev, "this dev is a root hub\n");
 		goto skip;
+	}
+	
+       if (!xhci_exynos) {
+         dev_dbg(ddev, "invalid device?\n");
+         goto skip;
 	}
 
 	pre_state = xhci_exynos->port_state;
@@ -283,13 +313,21 @@ static int xhci_exynos_check_port(struct xhci_hcd_exynos *exynos, struct usb_dev
 						udev->do_remote_wakeup =
 							(udev->config->desc.bmAttributes &
 								USB_CONFIG_ATT_WAKEUP) ? 1 : 0;
-						if (udev->do_remote_wakeup == 1) {
-							device_init_wakeup(ddev, 1);
-							usb_enable_autosuspend(dev);
-						}
 						dev_dbg(ddev, "%s, remote_wakeup = %d\n",
 							__func__, udev->do_remote_wakeup);
 						break;
+					}
+				}
+
+				if (udev->do_remote_wakeup == 1) {
+					device_init_wakeup(ddev, 1);
+					usb_enable_autosuspend(dev);
+					trace_android_vh_sound_usb_support_cpu_suspend(udev, 0,
+									&ap_suspend_enabled);
+					if (ap_suspend_enabled) {
+						xhci_exynos->ap_suspend_enabled = true;
+						__pm_relax(xhci_exynos->main_wakelock);
+						__pm_relax(xhci_exynos->shared_wakelock);
 					}
 				}
 			}
@@ -484,6 +522,46 @@ static void xhci_exynos_pm_runtime_init(struct device *dev)
 	init_waitqueue_head(&dev->power.wait_queue);
 }
 
+static struct xhci_plat_priv_overwrite xhci_plat_vendor_overwrite;
+
+int xhci_exynos_register_vendor_ops(struct xhci_vendor_ops *vendor_ops)
+{
+	if (vendor_ops == NULL)
+		return -EINVAL;
+
+	xhci_plat_vendor_overwrite.vendor_ops = vendor_ops;
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(xhci_exynos_register_vendor_ops);
+
+static int xhci_vendor_init(struct xhci_hcd *xhci)
+{
+	struct xhci_vendor_ops *ops = NULL;
+
+	if (xhci_plat_vendor_overwrite.vendor_ops)
+		ops = xhci->vendor_ops = xhci_plat_vendor_overwrite.vendor_ops;
+
+	if (ops && ops->vendor_init)
+		return ops->vendor_init(xhci);
+
+	return 0;
+}
+
+static int xhci_vendor_cleanup(struct xhci_hcd *xhci)
+{
+	struct xhci_vendor_ops *ops = xhci_vendor_get_ops(xhci);
+	int ret = 0;
+
+	if (ops && ops->vendor_cleanup)
+		ops->vendor_cleanup(xhci);
+	else
+		ret = -EOPNOTSUPP;
+
+	xhci->vendor_ops = NULL;
+	return ret;
+}
+
 int xhci_exynos_wake_lock(struct xhci_hcd_exynos *xhci_exynos,
 				   int is_main_hcd, int is_lock)
 {
@@ -500,26 +578,36 @@ int xhci_exynos_wake_lock(struct xhci_hcd_exynos *xhci_exynos,
 	}
 
 	if (is_lock) {
-		if (is_main_hcd) {
-			dev_info(xhci_exynos->dev, "%s: Main HCD WAKE LOCK\n", __func__);
-			__pm_stay_awake(xhci_exynos->main_wakelock);
+		if (xhci_exynos->ap_suspend_enabled) {
+			dev_info(xhci_exynos->dev, "%s: audio device, skip WAKE LOCK\n", __func__);
 		} else {
-			dev_info(xhci_exynos->dev, "%s: Shared HCD WAKE LOCK\n", __func__);
-			__pm_stay_awake(xhci_exynos->shared_wakelock);
+			if (is_main_hcd) {
+				dev_info(xhci_exynos->dev, "%s: Main HCD WAKE LOCK\n", __func__);
+				__pm_stay_awake(xhci_exynos->main_wakelock);
+			} else {
+				dev_info(xhci_exynos->dev, "%s: Shared HCD WAKE LOCK\n", __func__);
+				__pm_stay_awake(xhci_exynos->shared_wakelock);
+			}
 		}
 		/* Add a routine for disable IDLEIP (IP idle) */
 		dev_info(xhci_exynos->dev, "IDLEIP(SICD) disable.\n");
 		idle_ip_index = dwc3_otg_get_idle_ip_index();
 		exynos_update_ip_idle_status(idle_ip_index, 0);
 	} else {
-		if (is_main_hcd) {
-			dev_info(xhci_exynos->dev, "%s: Main HCD WAKE UNLOCK\n", __func__);
-			__pm_relax(xhci_exynos->main_wakelock);
+		if (xhci_exynos->ap_suspend_enabled) {
+			dev_info(xhci_exynos->dev, "%s: audio device, skip WAKE UNLOCK\n",
+				 __func__);
 		} else {
-			dev_info(xhci_exynos->dev, "%s: Shared HCD WAKE UNLOCK\n", __func__);
-			__pm_relax(xhci_exynos->shared_wakelock);
+			if (is_main_hcd) {
+				dev_info(xhci_exynos->dev, "%s: Main HCD WAKE UNLOCK\n", __func__);
+				__pm_relax(xhci_exynos->main_wakelock);
+			} else {
+				dev_info(xhci_exynos->dev, "%s: Shared HCD WAKE UNLOCK\n",
+					 __func__);
+				__pm_relax(xhci_exynos->shared_wakelock);
+			}
 		}
-
+		dev_info(xhci_exynos->dev, "IDLEIP(SICD) enable.\n");
 		/* Add a routine for enable IDLEIP (IP idle) */
 		idle_ip_index = dwc3_otg_get_idle_ip_index();
 		exynos_update_ip_idle_status(idle_ip_index, 1);
@@ -541,16 +629,16 @@ static int xhci_exynos_probe(struct platform_device *pdev)
 	int			ret;
 	int			irq;
 	struct wakeup_source	*main_wakelock, *shared_wakelock;
-
+pr_err("2\n");
 	if (usb_disabled())
 		return -ENODEV;
-
+pr_err("2\n");
 	driver = &xhci_exynos_hc_driver;
-
+pr_err("3\n");
 	irq = platform_get_irq(pdev, 0);
 	if (irq < 0)
 		return irq;
-
+pr_err("4\n");
 	/*
 	 * sysdev must point to a device that is known to the system firmware
 	 * or PCI hardware. We handle these three cases here:
@@ -563,10 +651,10 @@ static int xhci_exynos_probe(struct platform_device *pdev)
 			is_acpi_device_node(sysdev->fwnode))
 			break;
 	}
-
+pr_err("5\n");
 	if (!sysdev)
 		sysdev = &pdev->dev;
-
+pr_err("6\n");
 	/* Try to set 64-bit DMA first */
 	if (WARN_ON(!sysdev->dma_mask))
 		/* Platform did not initialize dma_mask */
@@ -575,59 +663,61 @@ static int xhci_exynos_probe(struct platform_device *pdev)
 	else
 		ret = dma_set_mask_and_coherent(sysdev, DMA_BIT_MASK(64));
 
+pr_err("7\n");
 	/* If seting 64-bit DMA mask fails, fall back to 32-bit DMA mask */
 	if (ret) {
 		ret = dma_set_mask_and_coherent(sysdev, DMA_BIT_MASK(32));
 		if (ret)
 			return ret;
 	}
-
+pr_err("8\n");
 	main_wakelock = wakeup_source_register(&pdev->dev, dev_name(&pdev->dev));
 	__pm_stay_awake(main_wakelock);
-
+pr_err("9\n");
 	/* Initialization shared wakelock for SS HCD */
 	shared_wakelock = wakeup_source_register(&pdev->dev, dev_name(&pdev->dev));
 	__pm_stay_awake(shared_wakelock);
-
+pr_err("10\n");
 	xhci_exynos_pm_runtime_init(&pdev->dev);
-
+pr_err("11\n");
 	pm_runtime_set_active(&pdev->dev);
 	pm_runtime_enable(&pdev->dev);
 	pm_runtime_get_noresume(&pdev->dev);
-
-	hcd = __usb_create_hcd(driver, sysdev, &pdev->dev,
-			       dev_name(&pdev->dev), NULL);
+pr_err("12\n");
+	hcd = __usb_create_hcd(driver, sysdev, &pdev->dev,       
+							dev_name(&pdev->dev), NULL);
+pr_err("13\n");
 	if (!hcd) {
 		ret = -ENOMEM;
 		goto disable_runtime;
 	}
 	hcd->skip_phy_initialization = 1;
-
+pr_err("14\n");
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	hcd->regs = devm_ioremap_resource(&pdev->dev, res);
 	if (IS_ERR(hcd->regs)) {
 		ret = PTR_ERR(hcd->regs);
 		goto put_hcd;
 	}
-
+pr_err("15\n");
 	hcd->rsrc_start = res->start;
 	hcd->rsrc_len = resource_size(res);
-
+pr_err("6\n");
 	xhci = hcd_to_xhci(hcd);
 	xhci_exynos = devm_kzalloc(&pdev->dev, sizeof(struct xhci_hcd_exynos), GFP_KERNEL);
 	xhci_exynos->dev = &pdev->dev;
-
+pr_err("16\n");
 	xhci_exynos->hcd = (struct usb_hcd *)platform_get_drvdata(pdev);
 	platform_set_drvdata(pdev, xhci_exynos);
-
+pr_err("17\n");
 	spin_lock_init(&xhci_exynos->xhcioff_lock);
-
+pr_err("18\n");
 	xhci_exynos->usb3_portsc = hcd->regs + PORTSC_OFFSET;
 	xhci_exynos->is_otg_only = 1;
 	xhci_exynos->port_state = PORT_EMPTY;
-
+pr_err("19\n");
 	xhci_exynos_register_notify();
-
+pr_err("20\n");
 	/*
 	 * Not all platforms have clks so it is not an error if the
 	 * clock do not exist.
@@ -637,26 +727,26 @@ static int xhci_exynos_probe(struct platform_device *pdev)
 		ret = PTR_ERR(xhci->reg_clk);
 		goto put_hcd;
 	}
-
+pr_err("21\n");
 	ret = clk_prepare_enable(xhci->reg_clk);
 	if (ret)
 		goto put_hcd;
-
+pr_err("22\n");
 	xhci->clk = devm_clk_get_optional(&pdev->dev, NULL);
 	if (IS_ERR(xhci->clk)) {
 		ret = PTR_ERR(xhci->clk);
 		goto disable_reg_clk;
 	}
-
+pr_err("23\n");
 	ret = clk_prepare_enable(xhci->clk);
 	if (ret)
 		goto disable_reg_clk;
-
+pr_err("24\n");
 	priv = hcd_to_xhci_exynos_priv(hcd);
 	priv->xhci_exynos = xhci_exynos;
-
+pr_err("25\n");
 	device_wakeup_enable(hcd->self.controller);
-
+pr_err("26\n");
 	xhci->main_hcd = hcd;
 	xhci->shared_hcd = __usb_create_hcd(driver, sysdev, &pdev->dev,
 			dev_name(&pdev->dev), hcd);
@@ -665,12 +755,12 @@ static int xhci_exynos_probe(struct platform_device *pdev)
 		goto disable_clk;
 	}
 	xhci->shared_hcd->skip_phy_initialization = 1;
-
+pr_err("27\n");
 	xhci_exynos->shared_hcd = xhci->shared_hcd;
-
+pr_err("28\n");
 	/* imod_interval is the interrupt moderation value in nanoseconds. */
 	xhci->imod_interval = 40000;
-
+pr_err("29\n");
 	/* Iterate over all parent nodes for finding quirks */
 	for (tmpdev = &pdev->dev; tmpdev; tmpdev = tmpdev->parent) {
 
@@ -686,7 +776,7 @@ static int xhci_exynos_probe(struct platform_device *pdev)
 		device_property_read_u32(tmpdev, "imod-interval-ns",
 					 &xhci->imod_interval);
 	}
-
+pr_err("30\n");
 	hcd->usb_phy = devm_usb_get_phy_by_phandle(sysdev, "usb-phy", 0);
 	if (IS_ERR(hcd->usb_phy)) {
 		ret = PTR_ERR(hcd->usb_phy);
@@ -698,7 +788,7 @@ static int xhci_exynos_probe(struct platform_device *pdev)
 		if (ret)
 			goto put_usb3_hcd;
 	}
-
+pr_err("31\n");
 	/* Get USB2.0 PHY for main hcd */
 	if (parent) {
 		xhci_exynos->phy_usb2 = devm_phy_get(parent, "usb2-phy");
@@ -708,35 +798,44 @@ static int xhci_exynos_probe(struct platform_device *pdev)
 				"%s: failed to get phy\n", __func__);
 		}
 	}
-
-	xhci_exynos->main_wakelock = main_wakelock;
-	xhci_exynos->shared_wakelock = shared_wakelock;
-
-	hcd->tpl_support = of_usb_host_tpl_support(sysdev->of_node);
-	xhci->shared_hcd->tpl_support = hcd->tpl_support;
-	ret = usb_add_hcd(hcd, irq, IRQF_SHARED);
+pr_err("32\n");
+	ret = xhci_vendor_init(xhci);
 	if (ret)
 		goto disable_usb_phy;
-
+pr_err("33\n");
+	xhci_exynos->main_wakelock = main_wakelock;
+	xhci_exynos->shared_wakelock = shared_wakelock;
+pr_err("34\n");
+	hcd->tpl_support = of_usb_host_tpl_support(sysdev->of_node);
+pr_err("34.1\n");
+	xhci->shared_hcd->tpl_support = hcd->tpl_support;
+pr_err("34.2\n");
+	ret = usb_add_hcd(hcd, irq, IRQF_SHARED);
+pr_err("34.3\n");
+	if (ret)
+		goto disable_usb_phy;
+pr_err("35\n");
 	if (HCC_MAX_PSA(xhci->hcc_params) >= 4)
 		xhci->shared_hcd->can_do_streams = 1;
-
+pr_err("36\n");
 	ret = usb_add_hcd(xhci->shared_hcd, irq, IRQF_SHARED);
 	if (ret)
 		goto dealloc_usb2_hcd;
-
+pr_err("37\n");
 	device_enable_async_suspend(&pdev->dev);
 	pm_runtime_put_noidle(&pdev->dev);
-
+pr_err("38\n");
 	device_set_wakeup_enable(&xhci->main_hcd->self.root_hub->dev, 1);
 	device_set_wakeup_enable(&xhci->shared_hcd->self.root_hub->dev, 1);
-
+pr_err("39\n");
+	xhci_exynos->ap_suspend_enabled = false;
+pr_err("40\n");
 	/*
 	 * Prevent runtime pm from being on as default, users should enable
 	 * runtime pm using power/control in sysfs.
 	 */
 	pm_runtime_forbid(&pdev->dev);
-
+pr_err("41\n");
 	return 0;
 
 
@@ -791,11 +890,21 @@ static int xhci_exynos_remove(struct platform_device *dev)
 		goto remove_hcd;
 
 remove_hcd:
+	/*
+	 * We jump to put_hcd here because we move usb_remove_hcd(shared_hcd)
+	 * and the following 3 lines to our vendor hook implementation. This
+	 * is to fix a race from our audio offload design. Please refer to the
+	 * commit message for the detailed information.
+	 */
+	if (!xhci_vendor_cleanup(xhci))
+		goto put_hcd;
+
 	usb_remove_hcd(shared_hcd);
 	xhci->shared_hcd = NULL;
 	usb_phy_shutdown(hcd->usb_phy);
 	usb_remove_hcd(hcd);
 
+put_hcd:
 	devm_iounmap(&dev->dev, hcd->regs);
 	usb_put_hcd(shared_hcd);
 
@@ -827,6 +936,9 @@ static int __maybe_unused xhci_exynos_suspend(struct device *dev)
 	struct usb_hcd	*hcd = xhci_exynos->hcd;
 	struct xhci_hcd	*xhci = hcd_to_xhci(hcd);
 	int ret;
+	int bypass = 0;
+	struct usb_device *udev = hcd->self.root_hub;
+	pm_message_t msg;
 
 	/*
 	 * xhci_suspend() needs `do_wakeup` to know whether host is allowed
@@ -836,6 +948,13 @@ static int __maybe_unused xhci_exynos_suspend(struct device *dev)
 	 * reconsider this when xhci_exynos_suspend enlarges its scope, e.g.,
 	 * also applies to runtime suspend.
 	 */
+
+	msg.event = 0;
+	trace_android_vh_usb_dev_suspend(udev, msg, &bypass);
+	if (bypass) {
+		ret = 0;
+		return 0;
+	}
 
 	ret = xhci_suspend(xhci, device_may_wakeup(dev));
 	if (ret)
@@ -850,6 +969,16 @@ static int __maybe_unused xhci_exynos_resume(struct device *dev)
 	struct usb_hcd	*hcd = xhci_exynos->hcd;
 	struct xhci_hcd	*xhci = hcd_to_xhci(hcd);
 	int ret;
+	int bypass = 0;
+	struct usb_device *udev = hcd->self.root_hub;
+	pm_message_t msg;
+
+	msg.event = 0;
+	trace_android_vh_usb_dev_resume(udev, msg, &bypass);
+	if (bypass) {
+		ret = 0;
+		return 0;
+	}
 
 	ret = xhci_priv_resume_quirk(hcd);
 	if (ret)

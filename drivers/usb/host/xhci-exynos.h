@@ -39,6 +39,7 @@ struct xhci_hcd_exynos {
 	int 			port_set_delayed;
 	u32 			portsc_control_priority;
 	enum usb_port_state	port_state;
+	bool			ap_suspend_enabled;
 };
 
 struct xhci_exynos_priv {
@@ -56,6 +57,7 @@ struct xhci_exynos_priv {
 #define hcd_to_xhci_exynos_priv(h) ((struct xhci_exynos_priv *)hcd_to_xhci(h)->priv)
 #define xhci_to_exynos_priv(x) ((struct xhci_exynos_priv *)(x)->priv)
 
+int xhci_exynos_register_vendor_ops(struct xhci_vendor_ops *vendor_ops);
 extern void __iomem *phycon_base_addr;
 extern int exynos_usbdrd_phy_vendor_set(struct phy *phy, int is_enable,
 					int is_cancel);

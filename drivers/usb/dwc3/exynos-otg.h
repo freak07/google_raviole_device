@@ -110,6 +110,7 @@ static inline int dwc3_ext_otg_stop(struct dwc3_otg *dotg)
 	return 0;
 }
 
+int dwc3_otg_host_enable(bool enabled);
 int dwc3_exynos_otg_init(struct dwc3 *dwc, struct dwc3_exynos *exynos);
 void dwc3_exynos_otg_exit(struct dwc3 *dwc, struct dwc3_exynos *exynos);
 int dwc3_otg_start(struct dwc3 *dwc, struct dwc3_exynos *exynos);
