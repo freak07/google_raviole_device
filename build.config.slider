@@ -52,6 +52,7 @@ gs/google-modules/amplifiers/cs35l41
 gs/google-modules/amplifiers/audiometrics
 gs/google-modules/aoc
 gs/google-modules/aoc/alsa
+gs/google-modules/aoc/usb
 gs/google-modules/touch/common
 gs/google-modules/touch/fts/ftm5
 gs/google-modules/touch/sec
